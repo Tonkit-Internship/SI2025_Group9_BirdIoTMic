@@ -14,7 +14,7 @@ from birdnet_analyzer.analyze.utils import (
 )
 
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
-ORIGINAL_LABELS_FILE = str(Path(SCRIPT_DIR).parent / cfg.LABELS_FILE)
+ORIGINAL_LABELS_FILE = str(Path(SCRIPT_DIR).parent / cfg.BIRDNET_LABELS_FILE)
 
 
 def analyze_file_wrapper(entry):
@@ -34,7 +34,7 @@ def analyze_file_wrapper(entry):
 
 
 def run_analysis(
-    input_path: str,
+    input_path: str | None,
     output_path: str | None,
     use_top_n: bool,
     top_n: int,
@@ -52,6 +52,7 @@ def run_analysis(
     week: int,
     use_yearlong: bool,
     sf_thresh: float,
+    selected_model: str,
     custom_classifier_file,
     output_types: str,
     additional_columns: list[str] | None,
@@ -59,7 +60,7 @@ def run_analysis(
     locale: str,
     batch_size: int,
     threads: int,
-    input_dir: str,
+    input_dir: str | None,
     skip_existing: bool,
     save_params: bool,
     progress: gr.Progress | None,
@@ -101,7 +102,8 @@ def run_analysis(
     from birdnet_analyzer.analyze.core import _set_params
 
     locale = locale.lower()
-    custom_classifier = custom_classifier_file if species_list_choice == gu._CUSTOM_CLASSIFIER else None
+    custom_classifier = custom_classifier_file if selected_model == gu._CUSTOM_CLASSIFIER else None
+    use_perch = selected_model == gu._USE_PERCH
     slist = species_list_file if species_list_choice == gu._CUSTOM_SPECIES else None
     lat = lat if species_list_choice == gu._PREDICT_SPECIES else -1
     lon = lon if species_list_choice == gu._PREDICT_SPECIES else -1
@@ -113,7 +115,7 @@ def run_analysis(
         custom_classifier=custom_classifier,
         sensitivity=min(1.25, max(0.75, float(sensitivity))),
         locale=locale,
-        overlap=max(0.0, min(2.9, float(overlap))),
+        overlap=max(0.0, min(4.9 if use_perch else 2.9, float(overlap))),
         merge_consecutive=max(1, int(merge_consecutive)),
         audio_speed=max(0.1, 1.0 / (audio_speed * -1)) if audio_speed < 0 else max(1.0, float(audio_speed)),
         fmin=max(0, min(cfg.SIG_FMAX, int(fmin))),
@@ -132,6 +134,7 @@ def run_analysis(
         top_n=top_n if use_top_n else None,
         output=output_path,
         additional_columns=additional_columns,
+        use_perch=use_perch,
     )
 
     if species_list_choice == gu._CUSTOM_CLASSIFIER:
@@ -171,9 +174,9 @@ def run_analysis(
         save_analysis_params(os.path.join(cfg.OUTPUT_PATH, cfg.ANALYSIS_PARAMS_FILENAME))
 
     return (
-        [[os.path.relpath(r[0], input_dir), bool(r[1])] for r in result_list]
+        [[os.path.relpath(r[0], input_dir), r[1] if isinstance(r[1], str) else None] for r in result_list]
         if input_dir
         else result_list[0][1]["csv"]
-        if result_list[0][1]
-        else None
+        if isinstance(result_list[0][1], dict)
+        else [result_list[0][1]]
     )

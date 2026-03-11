@@ -43,14 +43,29 @@ def embeddings(
             batch_size=2
         )
     """
-    from birdnet_analyzer.embeddings.utils import run
+    from birdnet_analyzer.embeddings.utils import extract_embeddings
     from birdnet_analyzer.utils import ensure_model_exists
 
     ensure_model_exists()
-    run(audio_input, database, overlap, audio_speed, fmin, fmax, threads, batch_size, file_output)
+    extract_embeddings(audio_input, database, overlap, audio_speed, fmin, fmax, threads, batch_size, file_output)
 
 
-def get_database(db_path: str):
+def try_get_database(db_path: str):
+    """Try to get the database object. Creates or opens the databse.
+    Args:
+        db: The path to the database.
+    Returns:
+        The database object or None if it could not be created or opened.
+    """
+    from perch_hoplite.db import sqlite_usearch_impl
+
+    try:
+        return sqlite_usearch_impl.SQLiteUsearchDB.create(db_path=db_path)
+    except ValueError:
+        return None
+
+
+def get_or_create_database(db_path: str):
     """Get the database object. Creates or opens the databse.
     Args:
         db: The path to the database.
@@ -67,4 +82,7 @@ def get_database(db_path: str):
             db_path=db_path,
             usearch_cfg=sqlite_usearch_impl.get_default_usearch_config(embedding_dim=1024),  # TODO: dont hardcode this
         )
-    return sqlite_usearch_impl.SQLiteUsearchDB.create(db_path=db_path)
+    try:
+        return sqlite_usearch_impl.SQLiteUsearchDB.create(db_path=db_path)
+    except ValueError:
+        return sqlite_usearch_impl.SQLiteUsearchDB.create(db_path=db_path, usearch_cfg=sqlite_usearch_impl.get_default_usearch_config(embedding_dim=1024))

@@ -55,7 +55,7 @@ def load_codes():
     Returns:
         A dictionary containing the eBird codes.
     """
-    with open(os.path.join(SCRIPT_DIR, cfg.CODES_FILE)) as cfile:
+    with open(os.path.join(SCRIPT_DIR, cfg.CODES_FILE), encoding="utf-8") as cfile:
         return json.load(cfile)
 
 
@@ -92,17 +92,14 @@ def generate_raven_table(timestamps: list[str], result: dict[str, list], afile_p
             selection_id += 1
             label = cfg.TRANSLATED_LABELS[cfg.LABELS.index(c[0])] if cfg.TRANSLATED_LABELS else c[0]
             code = cfg.CODES[c[0]] if c[0] in cfg.CODES else c[0]
-            rstring += (
-                f"{selection_id}\tSpectrogram 1\t1\t{start}\t{end}\t{low_freq}\t{high_freq}\t{label.split('_', 1)[-1]}\t{code}\t{c[1]:.4f}\t{afile_path}\t{start}\n"
-            )
+            lbl = label if cfg.USE_PERCH else label.split("_", 1)[-1]
+            rstring += f"{selection_id}\tSpectrogram 1\t1\t{start}\t{end}\t{low_freq}\t{high_freq}\t{lbl}\t{code}\t{c[1]:.4f}\t{afile_path}\t{start}\n"
 
         # Write result string to file
         out_string += rstring
 
     # If we don't have any valid predictions, we still need to add a line to the selection table
     # in case we want to combine results
-    # TODO: That's a weird way to do it, but it works for now. It would be better to keep track
-    # of file durations during the analysis.
     if len(out_string) == len(RAVEN_TABLE_HEADER) and cfg.OUTPUT_PATH is not None:
         selection_id += 1
         out_string += f"{selection_id}\tSpectrogram 1\t1\t0\t3\t{low_freq}\t{high_freq}\tnocall\tnocall\t1.0\t{afile_path}\t0\n"
@@ -132,7 +129,7 @@ def generate_audacity(timestamps: list[str], result: dict[str, list], result_pat
         for c in result[timestamp]:
             label = cfg.TRANSLATED_LABELS[cfg.LABELS.index(c[0])] if cfg.TRANSLATED_LABELS else c[0]
             ts = timestamp.replace("-", "\t")
-            lbl = label.replace("_", ", ")
+            lbl = label if cfg.USE_PERCH else label.replace("_", ", ")
             rstring += f"{ts}\t{lbl}\t{c[1]:.4f}\n"
 
         # Write result string to file
@@ -166,14 +163,21 @@ def generate_kaleidoscope(timestamps: list[str], result: dict[str, list], afile_
 
         for c in result[timestamp]:
             label = cfg.TRANSLATED_LABELS[cfg.LABELS.index(c[0])] if cfg.TRANSLATED_LABELS else c[0]
+
+            if cfg.USE_PERCH:
+                common = scientific = label
+            else:
+                split_label = label.split("_", 1)
+                scientific, common = split_label[0], split_label[-1]
+
             rstring += "{},{},{},{},{},{},{},{:.4f},{:.4f},{:.4f},{},{},{}\n".format(
                 parent_folder.rstrip("/"),
                 folder_name,
                 filename,
                 start,
                 float(end) - float(start),
-                label.split("_", 1)[0],
-                label.split("_", 1)[-1],
+                scientific,
+                common,
                 c[1],
                 cfg.LATITUDE,
                 cfg.LONGITUDE,
@@ -208,8 +212,8 @@ def generate_csv(timestamps: list[str], result: dict[str, list], afile_path: str
     columns_map = {}
 
     if cfg.ADDITIONAL_COLUMNS:
-        for col in cfg.ADDITIONAL_COLUMNS:
-            if col in POSSIBLE_ADDITIONAL_COLUMNS_MAP:
+        for col in POSSIBLE_ADDITIONAL_COLUMNS_MAP:
+            if col in cfg.ADDITIONAL_COLUMNS:
                 columns_map[col] = POSSIBLE_ADDITIONAL_COLUMNS_MAP[col]()
 
         if columns_map:
@@ -221,7 +225,14 @@ def generate_csv(timestamps: list[str], result: dict[str, list], afile_path: str
         for c in result[timestamp]:
             start, end = timestamp.split("-", 1)
             label = cfg.TRANSLATED_LABELS[cfg.LABELS.index(c[0])] if cfg.TRANSLATED_LABELS else c[0]
-            rstring += f"{start},{end},{label.split('_', 1)[0]},{label.split('_', 1)[-1]},{c[1]:.4f},{afile_path}"
+
+            if cfg.USE_PERCH:
+                common = scientific = label
+            else:
+                split_label = label.split("_", 1)
+                scientific, common = split_label[0], split_label[-1]
+
+            rstring += f"{start},{end},{scientific},{common},{c[1]:.4f},{afile_path}"
 
             if columns_map:
                 rstring += "," + ",".join(str(val) for val in columns_map.values())
@@ -352,7 +363,11 @@ def combine_kaleidoscope_files(saved_results: list[str]):
         None
     """
     # Combine all files
-    with open(os.path.join(cfg.OUTPUT_PATH, cfg.OUTPUT_KALEIDOSCOPE_FILENAME), "w", encoding="utf-8") as f:
+    with open(
+        os.path.join(cfg.OUTPUT_PATH, cfg.OUTPUT_KALEIDOSCOPE_FILENAME),
+        "w",
+        encoding="utf-8",
+    ) as f:
         f.write(KALEIDOSCOPE_HEADER)
 
         for rfile in saved_results:
@@ -395,7 +410,7 @@ def combine_csv_files(saved_results: list[str]):
         f.write(out_string)
 
 
-def combine_results(saved_results: Sequence[dict[str, str] | None]):
+def combine_results(saved_results: Sequence[dict[str, str] | str]):
     """
     Combines various types of result files based on the configuration settings.
     This function checks the types of results specified in the configuration
@@ -410,13 +425,13 @@ def combine_results(saved_results: Sequence[dict[str, str] | None]):
         None
     """
     if "table" in cfg.RESULT_TYPES:
-        combine_raven_tables([f["table"] for f in saved_results if f])
+        combine_raven_tables([f["table"] for f in saved_results if isinstance(f, dict)])
 
     if "kaleidoscope" in cfg.RESULT_TYPES:
-        combine_kaleidoscope_files([f["kaleidoscope"] for f in saved_results if f])
+        combine_kaleidoscope_files([f["kaleidoscope"] for f in saved_results if isinstance(f, dict)])
 
     if "csv" in cfg.RESULT_TYPES:
-        combine_csv_files([f["csv"] for f in saved_results if f])
+        combine_csv_files([f["csv"] for f in saved_results if isinstance(f, dict)])
 
 
 def merge_consecutive_detections(results: dict[str, list], max_consecutive: int | None = None):
@@ -515,7 +530,15 @@ def get_raw_audio_from_file(fpath: str, offset, duration):
         The signal split into a list of chunks.
     """
     # Open file
-    sig, rate = audio.open_audio_file(fpath, cfg.SAMPLE_RATE, offset, duration, cfg.BANDPASS_FMIN, cfg.BANDPASS_FMAX, cfg.AUDIO_SPEED)
+    sig, rate = audio.open_audio_file(
+        fpath,
+        cfg.SAMPLE_RATE,
+        offset,
+        duration,
+        cfg.BANDPASS_FMIN,
+        cfg.BANDPASS_FMAX,
+        cfg.AUDIO_SPEED,
+    )
 
     # Split into raw audio chunks
     return audio.split_signal(sig, rate, cfg.SIG_LENGTH, cfg.SIG_OVERLAP, cfg.SIG_MINLEN)
@@ -586,7 +609,7 @@ def predict(samples):
     prediction = model.predict(data)
 
     # Logits or sigmoid activations?
-    if cfg.APPLY_SIGMOID:
+    if cfg.APPLY_SIGMOID and not cfg.USE_PERCH:
         prediction = model.flat_sigmoid(np.array(prediction), sensitivity=-1, bias=cfg.SIGMOID_SENSITIVITY)
 
     return prediction
@@ -628,10 +651,8 @@ def get_result_file_names(fpath: str):
 def analyze_file(item) -> dict[str, str] | None:
     """
     Analyzes an audio file and generates prediction results.
-
     Args:
         item (tuple): A tuple containing the file path (str) and configuration settings.
-
     Returns:
         dict or None: A dictionary of result file names if analysis is successful,
                       None if the file is skipped or an error occurs.
@@ -657,6 +678,9 @@ def analyze_file(item) -> dict[str, str] | None:
 
     # Process each chunk
     try:
+        # ------------------------------------------------------------------
+        # จุดนี้คือจุดที่น่าจะพัง (iterate_audio_chunks)
+        # ------------------------------------------------------------------
         for s_start, s_end, pred in iterate_audio_chunks(fpath):
             if not cfg.LABELS:
                 cfg.LABELS = [f"Species-{i}_Species-{i}" for i in range(len(pred))]
@@ -672,16 +696,21 @@ def analyze_file(item) -> dict[str, str] | None:
             if cfg.TOP_N:
                 p_sorted = p_sorted[: cfg.TOP_N]
 
-            # TODO: hier schon top n oder min conf raussortieren
             # Store top 5 results and advance indices
             results[str(s_start) + "-" + str(s_end)] = p_sorted
 
     except Exception as ex:
-        # Write error log
-        print(f"Error: Cannot analyze audio file {fpath}.\n", flush=True)
+        # 🔥 แก้ไขตรงนี้: สั่งให้ Print Error ออกมาดูให้หมด! 🔥
+        import traceback # import ตรงนี้กันเหนียวเผื่อข้างบนลืม
+        print(f"Error: Cannot analyze audio file {fpath}.", flush=True)
+        print(f"🔴 ACTUAL ERROR MESSAGE: {str(ex)}", flush=True) # ปริ้นท์ชื่อ Error
+        print("🔴 FULL TRACEBACK:", flush=True)
+        traceback.print_exc() # ปริ้นท์บรรทัดที่พังอย่างละเอียด
+        
+        # ส่วนเดิมของโค้ด (เก็บไว้เหมือนเดิม)
         utils.write_error_log(ex)
-
-        return None
+        msg = str(ex)
+        return msg or repr(ex).strip("()")
 
     # Save as selection table
     try:
@@ -690,9 +719,9 @@ def analyze_file(item) -> dict[str, str] | None:
     except Exception as ex:
         # Write error log
         print(f"Error: Cannot save result for {fpath}.\n", flush=True)
+        print(f"🔴 SAVE ERROR: {str(ex)}", flush=True) # เพิ่ม debug ตรงนี้ด้วย
         utils.write_error_log(ex)
-
-        return None
+        return str(ex)
 
     delta_time = (datetime.datetime.now() - start_time).total_seconds()
     print(f"Finished {fpath} in {delta_time:.2f} seconds", flush=True)

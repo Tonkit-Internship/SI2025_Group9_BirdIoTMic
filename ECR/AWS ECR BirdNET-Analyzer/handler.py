@@ -2,156 +2,140 @@ import os
 import sys
 import subprocess
 import boto3
-from numba.core import config
+import shutil
 import csv
+import numpy as np
+import soundfile as sf
+import uuid
 from urllib.parse import unquote
-from boto3.dynamodb.conditions import Key
-from datetime import datetime
 
-config.DISABLE_JIT = True
-os.environ["NUMBA_DISABLE_JIT"] = "1"
-
-def update_species_in_dynamodb(csv_file_path, file_name):
-    dynamodb = boto3.resource('dynamodb')
-    table = dynamodb.Table('data-birdiotmic')
-
-    parts = file_name.split("_")
-    if len(parts) < 3:
-        print("❌ Invalid file name format")
-        return
-
-    date_key = f"{parts[0]}_{parts[1]}"  # ex: 20250719_0540
-    device_id = parts[2]                 # ex: ESP32-02
-
-    species_new = set()
-    try:
-        with open(csv_file_path, newline='') as csvfile:
-            reader = csv.DictReader(csvfile)
-            for row in reader:
-                try:
-                    if float(row['Confidence']) > 0.6:
-                        if row['Common name'] and row['Common name'] != "-":
-                            species_new.add(row['Common name'])
-                except:
-                    continue
-    except Exception as e:
-        print(f"❌ Error reading CSV: {e}")
-        return
-
-    if not species_new:
-        print("⚠️ No high-confidence species detected → setting species = []")
-        try:
-            table.update_item(
-                Key={'DATE': date_key, 'DEVICE': device_id},
-                UpdateExpression='SET species = :val',
-                ExpressionAttributeValues={':val': []}
-            )
-        except Exception as e:
-            print(f"❌ Error clearing species: {e}")
-        return
-
-    try:
-        # อ่านข้อมูลปัจจุบัน
-        response = table.get_item(Key={'DATE': date_key, 'DEVICE': device_id})
-        item = response.get('Item', {})
-        existing_species = set(item.get('species', []))
-        updated_species = sorted(species_new)
-
-        # อัปเดตเฉพาะฟิลด์ species
-        table.update_item(
-            Key={'DATE': date_key, 'DEVICE': device_id},
-            UpdateExpression='SET species = :val',
-            ExpressionAttributeValues={':val': updated_species}
-        )
-
-        print(f"✅ Updated species for {date_key} {device_id}: {updated_species}")
-
-    except Exception as e:
-        print(f"❌ Error updating DynamoDB: {e}")
-
-def is_audio_file(filename):
-    audio_extensions = ('.mp3', '.wav', '.flac', '.m4a', '.ogg', '.aac')
-    return filename.lower().endswith(audio_extensions)
+# ตั้งค่า Environment เพื่อความเสถียรบน AWS Lambda
+os.environ["NUMBA_CACHE_DIR"] = "/tmp"
+os.environ["MPLCONFIGDIR"] = "/tmp"
+os.environ["KAGGLEHUB_CACHE"] = "/tmp"
+os.environ["LD_LIBRARY_PATH"] = "/usr/lib64:" + os.environ.get("LD_LIBRARY_PATH", "")
 
 def lambda_handler(event, context):
     s3 = boto3.client('s3')
+    dynamodb = boto3.resource('dynamodb')
+    table = dynamodb.Table('data-birdiotmic')
 
-    source_bucket = event['Records'][0]['s3']['bucket']['name']
+    # 1. ดึงข้อมูลจาก S3 event
+    bucket = event['Records'][0]['s3']['bucket']['name']
     key = unquote(event['Records'][0]['s3']['object']['key'])
-
-    print(f"Received event for bucket: {source_bucket}, key: {key}")
-    if not is_audio_file(key):
-        print(f"File {key} is not an audio file. Skipping processing.")
-        return {"statusCode": 200, "message": "Not an audio file, skipping."}
-
-    safe_key = key.replace(' ', '_')
-    base_name = os.path.basename(safe_key).rsplit('.', 1)[0]
-    input_file = f'/tmp/{base_name}'
-    output_dir = '/tmp/output'
-    os.makedirs(output_dir, exist_ok=True)
-
-    print(f"Downloading s3://{source_bucket}/{key} to {input_file}")
-    try:
-        s3.download_file(source_bucket, key, input_file)
-        print("Download completed")
-    except Exception as e:
-        print(f"Error downloading file: {e}")
-        raise
-
-    print("Starting BirdNET analysis...")
-    env = os.environ.copy()
-    env["NUMBA_CACHE_DIR"] = "/tmp"
-
-    result = subprocess.run([
-        sys.executable, "-m", "birdnet_analyzer.analyze",
-        input_file,
-        "--output", output_dir,
-        "--lat", "13.75",
-        "--lon", "100.50",
-        "--rtype", "csv",
-        "--locale", "en"
-    ], capture_output=True, text=True, env=env)
-
-    print(f"BirdNET return code: {result.returncode}")
-    print(f"BirdNET stdout: {result.stdout}")
-    print(f"BirdNET stderr: {result.stderr}")
-
-    # หาไฟล์ CSV ที่เป็นผลลัพธ์
-    csv_files = [f for f in os.listdir(output_dir) if f.endswith(".csv") and "results" in f]
-    if csv_files:
-        output_file = os.path.join(output_dir, csv_files[0])
-        output_key = safe_key.rsplit('.', 1)[0] + "_output.csv"
-
-        # 👇 เปลี่ยน bucket ปลายทางเป็น analysis-birdiotmic
-        target_bucket = "analysis-birdiotmic"
-
-        print(f"Uploading result file {output_file} to s3://{target_bucket}/{output_key}")
+    
+    base_name = os.path.basename(key).rsplit('.', 1)[0]
+    parts = base_name.split("_")
+    
+    if len(parts) >= 3:
+        date_key = f"{parts[0]}_{parts[1]}" 
+        device_id = parts[2]
         try:
-            s3.upload_file(output_file, target_bucket, output_key)
-            print("✅ Upload to analysis-birdiotmic completed")
-            update_species_in_dynamodb(output_file, base_name)
-        except Exception as e:
-            print(f"❌ Error uploading result: {e}")
-            raise
+            coords = parts[3].split(",")
+            lat, lon = coords[0], coords[1]
+        except:
+            lat, lon = "13.75", "100.50"
     else:
-        print("No CSV file found in output directory.")
-        print("Files in output directory:", os.listdir(output_dir))
-        return {"statusCode": 500, "error": "CSV output file not found"}
+        date_key = "unknown"
+        device_id = "unknown"
+        lat, lon = "13.75", "100.50"
+    
+    print(f"🚀 Processing Key: {key}")
 
-    # Cleanup
+    # 2. กำหนด Path สำหรับทำงาน (ใช้ UUID เพื่อป้องกันการชนกันของไฟล์)
+    run_id = str(uuid.uuid4())[:8]
+    work_dir = f"/tmp/birdnet_app_{run_id}"
+    output_dir = f"/tmp/output_{run_id}"
+    input_file = f'/tmp/input_{run_id}.wav'
+    
+    final_species = []
+
     try:
-        if os.path.exists(input_file):
-            os.remove(input_file)
-        if os.path.exists(output_dir):
-            for f in os.listdir(output_dir):
-                os.remove(os.path.join(output_dir, f))
-            os.rmdir(output_dir)
-        print("✅ Cleanup completed")
-    except Exception as cleanup_error:
-        print(f"⚠️ Cleanup failed: {cleanup_error}")
+        # 3. เตรียมพื้นที่ทำงาน
+        if os.path.exists(work_dir): shutil.rmtree(work_dir, ignore_errors=True)
+        os.makedirs(output_dir, exist_ok=True)
 
-    return {
-        "statusCode": 200,
-        "stdout": result.stdout,
-        "stderr": result.stderr
-    }
+        # 4. ก๊อปปี้ BirdNET และดาวน์โหลดไฟล์เสียง
+        print("📦 Setting up BirdNET analyzer...")
+        shutil.copytree("/var/task/birdnet_analyzer", f"{work_dir}/birdnet_analyzer")
+        
+        print(f"📥 Downloading audio to {input_file}")
+        s3.download_file(bucket, key, input_file)
+
+        # 5. รัน BirdNET Analysis
+        env = os.environ.copy()
+        env["PYTHONPATH"] = f"{work_dir}:" + env.get("PYTHONPATH", "")
+        model_path = "/var/task/BirdNET_GLOBAL_6K_V2.4_Model"
+        
+        cmd = [
+            sys.executable, "-m", "birdnet_analyzer.analyze",
+            "-o", output_dir,
+            "--lat", lat,
+            "--lon", lon,
+            "--rtype", "csv",
+            "--min_conf", "0.1",
+            "--sensitivity", "1.25",
+            "--threads", "1",
+            "-c", model_path,
+            input_file
+        ]
+
+        print(f"📢 Executing BirdNET...")
+        process = subprocess.Popen(
+            cmd, cwd=work_dir, env=env, 
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+            text=True, bufsize=1
+        )
+
+        for line in iter(process.stdout.readline, ''):
+            if line.strip(): print(f"[BirdNET]: {line.strip()}")
+        
+        process.stdout.close()
+        process.wait()
+
+        # 6. ประมวลผลผลลัพธ์
+        result_files = [f for f in os.listdir(output_dir) if f.endswith('.csv') and "params" not in f]
+        
+        if result_files:
+            csv_path = os.path.join(output_dir, result_files[0])
+            
+            # อัปโหลดผลวิเคราะห์กลับ S3
+            history_key = f"analysis/history/{date_key}_{device_id}_result.csv"
+            s3.upload_file(csv_path, 'analysis-birdiotmic', history_key)
+
+            # อ่านรายชื่อนก
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                species_set = set()
+                for row in reader:
+                    conf = row.get('Confidence') or row.get('confidence') or row.get('Score', 0)
+                    name = row.get('Common name') or row.get('Species')
+                    if name and float(conf) > 0.5:
+                        species_set.add(name)
+                final_species = list(species_set)
+
+        # 7. อัปเดต DynamoDB
+        if device_id != "unknown":
+            table.update_item(
+                Key={'DATE': date_key, 'DEVICE': device_id},
+                UpdateExpression="SET species = :s, #st = :c",
+                ExpressionAttributeNames={'#st': 'status'},
+                ExpressionAttributeValues={':s': final_species, ':c': "analysis_completed"}
+            )
+
+    except Exception as e:
+        print(f"❌ FATAL ERROR: {str(e)}")
+        raise e
+
+    finally:
+        # 🔥 ส่วน Cleanup: ลบทุกอย่างทิ้งไม่ว่าจะสำเร็จหรือไม่
+        print("🧹 Cleaning up workspace...")
+        try:
+            if os.path.exists(work_dir): shutil.rmtree(work_dir, ignore_errors=True)
+            if os.path.exists(output_dir): shutil.rmtree(output_dir, ignore_errors=True)
+            if os.path.exists(input_file): os.remove(input_file)
+            print("✨ Workspace is clean.")
+        except Exception as cleanup_err:
+            print(f"⚠️ Cleanup warning: {str(cleanup_err)}")
+
+    return {"status": "success", "detected_count": len(final_species)}

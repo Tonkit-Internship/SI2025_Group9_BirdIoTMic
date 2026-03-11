@@ -15,11 +15,13 @@ RANDOM_SEED: int = 42
 
 MODEL_VERSION: str = "V2.4"
 PB_MODEL: str = os.path.join(SCRIPT_DIR, "checkpoints/V2.4/BirdNET_GLOBAL_6K_V2.4_Model")
-# MODEL_PATH = PB_MODEL # This will load the protobuf model
-MODEL_PATH: str = os.path.join(SCRIPT_DIR, "checkpoints/V2.4/BirdNET_GLOBAL_6K_V2.4_Model_FP32.tflite")
+BIRDNET_MODEL_PATH: str = os.path.join(SCRIPT_DIR, "checkpoints/V2.4/BirdNET_GLOBAL_6K_V2.4_Model_FP32.tflite")
+PERCH_V2_MODEL_PATH: str = os.path.join(SCRIPT_DIR, "checkpoints/perch_v2")
 MDATA_MODEL_PATH: str = os.path.join(SCRIPT_DIR, "checkpoints/V2.4/BirdNET_GLOBAL_6K_V2.4_MData_Model_V2_FP16.tflite")
-LABELS_FILE: str = os.path.join(SCRIPT_DIR, "checkpoints/V2.4/BirdNET_GLOBAL_6K_V2.4_Labels.txt")
+BIRDNET_LABELS_FILE: str = os.path.join(SCRIPT_DIR, "checkpoints/V2.4/BirdNET_GLOBAL_6K_V2.4_Labels.txt")
+PERCH_LABELS_FILE: str = os.path.join(PERCH_V2_MODEL_PATH, "assets", "labels.csv")
 TRANSLATED_LABELS_PATH: str = os.path.join(SCRIPT_DIR, "labels/V2.4")
+USE_PERCH: bool = False
 
 ##################
 # Audio settings #
@@ -28,13 +30,15 @@ TRANSLATED_LABELS_PATH: str = os.path.join(SCRIPT_DIR, "labels/V2.4")
 # We use a sample rate of 48kHz, so the model input size is
 # (batch size, 48000 kHz * 3 seconds) = (1, 144000)
 # Recordings will be resampled automatically.
-SAMPLE_RATE: int = 48000
+BIRDNET_SAMPLE_RATE: int = 48000
+PERCH_SAMPLE_RATE: int = 32000
 
 # We're using 3-second chunks
-SIG_LENGTH: float = 3.0
+BIRDNET_SIG_LENGTH: float = 3.0
+PERCH_SIG_LENGTH: float = 5.0
 
 # Define overlap between consecutive chunks <3.0; 0 = no overlap
-SIG_OVERLAP: float = 0
+SIG_OVERLAP: float = 0.0
 
 # Define minimum length of audio chunk for prediction,
 # chunks shorter than 3 seconds will be padded with zeros
@@ -89,6 +93,15 @@ SIGMOID_SENSITIVITY: float = 1.0
 # (be aware: if APPLY_SIGMOID = False, this no longer represents
 # probabilities and needs to be adjusted)
 MIN_CONFIDENCE: float = 0.25
+
+# Maximum confidence score for the segments feature.
+MAX_CONFIDENCE: float = 1.0
+
+# How segments are selected from the result files.
+SEGMENTS_COLLECTION_MODE: str = "random"
+
+# Number of bins for the balanced collection mode
+BALANCED_COLLECTION_BINS: int = 10
 
 # Number of consecutive detections for one species to merge into one
 # If set to 1 or 0, no merging will be done
@@ -220,7 +233,7 @@ CODES = {}
 LABELS: list[str] = []
 TRANSLATED_LABELS: list[str] = []
 SPECIES_LIST: list[str] = []
-ERROR_LOG_FILE: str = "/tmp/error_log.txt"
+ERROR_LOG_FILE: str = os.path.join(SCRIPT_DIR, "error_log.txt")
 FILE_LIST = []
 FILE_STORAGE_PATH: str = ""
 
@@ -228,6 +241,10 @@ FILE_STORAGE_PATH: str = ""
 # If None, no custom classifier will be used
 # Make sure to set the LABELS_FILE above accordingly
 CUSTOM_CLASSIFIER: str | None = None
+MODEL_PATH: str | None = None
+LABELS_FILE: str | None = None
+SAMPLE_RATE: int | None = None
+SIG_LENGTH: float | None = None
 
 ######################
 # Get and set config #
@@ -241,3 +258,11 @@ def get_config():
 def set_config(c: dict):
     for k, v in c.items():
         globals()[k] = v
+
+
+#####################
+# Convenience funcs #
+#####################
+
+def perch_labels_file():
+    return os.path.join(PERCH_V2_MODEL_PATH, "assets", "labels.csv")

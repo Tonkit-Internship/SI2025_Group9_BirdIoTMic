@@ -1,9 +1,8 @@
-# ruff: noqa: I001
 import gradio as gr
 
 import birdnet_analyzer.config as cfg
-import birdnet_analyzer.gui.utils as gu
 import birdnet_analyzer.gui.localization as loc
+import birdnet_analyzer.gui.utils as gu
 
 OUTPUT_TYPE_MAP = {
     "Raven selection table": "table",
@@ -21,6 +20,7 @@ ADDITIONAL_COLUMNS_MAP = {
     "Species list file": "species_list",
     "Model file": "model",
 }
+
 
 @gu.gui_runtime_error_handler
 def run_batch_analysis(
@@ -41,6 +41,7 @@ def run_batch_analysis(
     week,
     use_yearlong,
     sf_thresh,
+    selected_model,
     custom_classifier_file,
     output_type,
     additional_columns,
@@ -50,7 +51,7 @@ def run_batch_analysis(
     threads,
     input_dir,
     skip_existing,
-    progress=gr.Progress(),
+    progress=gr.Progress(track_tqdm=True),
 ):
     from birdnet_analyzer.gui.analysis import run_analysis
 
@@ -64,7 +65,7 @@ def run_batch_analysis(
     if fmin is None or fmax is None or fmin < cfg.SIG_FMIN or fmax > cfg.SIG_FMAX or fmin > fmax:
         raise gr.Error(f"{loc.localize('validation-no-valid-frequency')} [{cfg.SIG_FMIN}, {cfg.SIG_FMAX}]")
 
-    return run_analysis(
+    results = run_analysis(
         None,
         output_path,
         use_top_n,
@@ -83,6 +84,7 @@ def run_batch_analysis(
         week,
         use_yearlong,
         sf_thresh,
+        selected_model,
         custom_classifier_file,
         output_type,
         additional_columns,
@@ -95,6 +97,22 @@ def run_batch_analysis(
         True,
         progress,
     )
+
+    def map_to_reason(result):
+        match result:
+            case "NoBackendError":
+                return loc.localize("multi-tab-file-error-nobackend")
+            case _:
+                return result
+
+    skipped_files = [[path, map_to_reason(successful)] for path, successful in results if isinstance(successful, str)]
+    header = (
+        [loc.localize("multi-tab-result-dataframe-column-invalid-file-header"), loc.localize("multi-tab-result-dataframe-column-reason-header")]
+        if skipped_files
+        else [loc.localize("multi-tab-result-dataframe-column-success-header")]
+    )
+
+    return gr.update(value=skipped_files, headers=header, col_count=2 if skipped_files else 1, elem_classes=None if skipped_files else "success")
 
 
 def build_multi_analysis_tab():
@@ -119,7 +137,7 @@ def build_multi_analysis_tab():
                     if folder:
                         files_and_durations = gu.get_audio_files_and_durations(folder)
                         if len(files_and_durations) > 100:
-                            return [folder, *files_and_durations[:100], ["..."]]  # hopefully fixes issue#272
+                            return [folder, [*files_and_durations[:100], ("...", "...")]]  # hopefully fixes issue#272
                         return [folder, files_and_durations]
 
                     return ["", [[loc.localize("multi-tab-samples-dataframe-no-files-found")]]]
@@ -144,29 +162,7 @@ def build_multi_analysis_tab():
                     show_progress="hidden",
                 )
 
-        (
-            use_top_n,
-            top_n_input,
-            confidence_slider,
-            sensitivity_slider,
-            overlap_slider,
-            merge_consecutive_slider,
-            audio_speed_slider,
-            fmin_number,
-            fmax_number,
-        ) = gu.sample_sliders()
-
-        (
-            species_list_radio,
-            species_file_input,
-            lat_number,
-            lon_number,
-            week_number,
-            sf_thresh_number,
-            yearlong_checkbox,
-            selected_classifier_state,
-            map_plot,
-        ) = gu.species_lists()
+        sample_settings, species_settings, model_settings = gu.sample_species_model_settings(opened=False)
 
         with gr.Accordion(loc.localize("multi-tab-output-accordion-label"), open=True), gr.Group():
             output_type_radio = gr.CheckboxGroup(
@@ -216,32 +212,28 @@ def build_multi_analysis_tab():
 
         start_batch_analysis_btn = gr.Button(loc.localize("analyze-start-button-label"), variant="huggingface")
 
-        result_grid = gr.Matrix(
-            headers=[
-                loc.localize("multi-tab-result-dataframe-column-file-header"),
-                loc.localize("multi-tab-result-dataframe-column-execution-header"),
-            ],
-        )
+        result_grid = gr.Matrix(headers=[""], col_count=1)
 
         inputs = [
             output_directory_predict_state,
-            use_top_n,
-            top_n_input,
-            confidence_slider,
-            sensitivity_slider,
-            overlap_slider,
-            merge_consecutive_slider,
-            audio_speed_slider,
-            fmin_number,
-            fmax_number,
-            species_list_radio,
-            species_file_input,
-            lat_number,
-            lon_number,
-            week_number,
-            yearlong_checkbox,
-            sf_thresh_number,
-            selected_classifier_state,
+            sample_settings["use_top_n_checkbox"],
+            sample_settings["top_n_input"],
+            sample_settings["confidence_slider"],
+            sample_settings["sensitivity_slider"],
+            sample_settings["overlap_slider"],
+            sample_settings["merge_consecutive_slider"],
+            sample_settings["audio_speed_slider"],
+            sample_settings["fmin_number"],
+            sample_settings["fmax_number"],
+            species_settings["species_list_radio"],
+            species_settings["species_file_input"],
+            species_settings["lat_number"],
+            species_settings["lon_number"],
+            species_settings["week_number"],
+            species_settings["yearlong_checkbox"],
+            species_settings["sf_thresh_number"],
+            model_settings["model_selection_radio"],
+            model_settings["selected_classifier_state"],
             output_type_radio,
             additional_columns_,
             combine_tables_checkbox,
@@ -258,7 +250,7 @@ def build_multi_analysis_tab():
         start_batch_analysis_btn.click(run_batch_analysis, inputs=inputs, outputs=result_grid)
         output_type_radio.change(show_additional_columns, inputs=output_type_radio, outputs=additional_columns_)
 
-    return lat_number, lon_number, map_plot
+    return species_settings["lat_number"], species_settings["lon_number"], species_settings["map_plot"]
 
 
 if __name__ == "__main__":

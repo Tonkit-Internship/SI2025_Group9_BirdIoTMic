@@ -1,41 +1,58 @@
 # ruff: noqa: PLW0603
+# pyright: reportOptionalMemberAccess=false
 """Contains functions to use the BirdNET models."""
 
+import csv
+import json
+import logging
 import os
-import sys
-import warnings
+from typing import Literal
 
+import keras
 import numpy as np
+import tensorflow as tf
 
 import birdnet_analyzer.config as cfg
 from birdnet_analyzer import utils
+from birdnet_analyzer.train import custom_models
 
-SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
-
-
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-
-warnings.filterwarnings("ignore")
-
-# Import TFLite from runtime or Tensorflow;
-# import Keras if protobuf model;
-# NOTE: we have to use TFLite if we want to use
-# the metadata model or want to extract embeddings
 try:
     import tflite_runtime.interpreter as tflite  # type: ignore
 except ModuleNotFoundError:
     from tensorflow import lite as tflite
-if not cfg.MODEL_PATH.endswith(".tflite"):
-    from tensorflow import keras
 
-INTERPRETER: tflite.Interpreter = None
-C_INTERPRETER: tflite.Interpreter = None
-M_INTERPRETER: tflite.Interpreter = None
+tf.get_logger().setLevel("ERROR")
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
+INTERPRETER = None
+C_INTERPRETER = None
+M_INTERPRETER = None
 OUTPUT_DETAILS = None
 PBMODEL = None
+PERCH_MODEL = None
 C_PBMODEL = None
 EMPTY_CLASS_EXCEPTION_REF = None
+
+
+class WrappedSavedModel(keras.layers.Layer):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def call(self, inputs):
+        outputs = self.fn(inputs)
+        return list(outputs.values())[0]
+
+
+def _load_interpreter(mpath, threads):
+    return tflite.Interpreter(
+        model_path=mpath,
+        num_threads=threads,
+        # XNNPACK disabled, because it does not support variable inputsize anyway (ie batchsize)
+        experimental_op_resolver_type=tflite.experimental.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES,
+    )
 
 
 def get_empty_class_exception():
@@ -361,11 +378,7 @@ def upsampling(x: np.ndarray, y: np.ndarray, ratio=0.5, mode="repeat"):
     rng = np.random.default_rng(cfg.RANDOM_SEED)
 
     # Determine min number of samples
-    min_samples = (
-        int(max(y.sum(axis=0), len(y) - y.sum(axis=0)) * ratio)
-        if cfg.BINARY_CLASSIFICATION
-        else int(np.max(y.sum(axis=0)) * ratio)
-    )
+    min_samples = int(max(y.sum(axis=0), len(y) - y.sum(axis=0)) * ratio) if cfg.BINARY_CLASSIFICATION else int(np.max(y.sum(axis=0)) * ratio)
 
     x_temp = []
     y_temp = []
@@ -463,6 +476,9 @@ def save_model_params(path):
             "Upsamling ratio",
             "use mixup",
             "use label smoothing",
+            "use focal loss",
+            "focal loss alpha",
+            "focal loss gamma",
             "BirdNET Model version",
         ),
         (
@@ -477,6 +493,9 @@ def save_model_params(path):
             cfg.UPSAMPLING_RATIO,
             cfg.TRAIN_WITH_MIXUP,
             cfg.TRAIN_WITH_LABEL_SMOOTHING,
+            cfg.TRAIN_WITH_FOCAL_LOSS,
+            cfg.FOCAL_LOSS_ALPHA,
+            cfg.FOCAL_LOSS_GAMMA,
             cfg.MODEL_VERSION,
         ),
     )
@@ -512,13 +531,14 @@ def load_model(class_output=True):
     global OUTPUT_LAYER_INDEX
     global OUTPUT_DETAILS
 
+    if cfg.MODEL_PATH is None:
+        raise ValueError("MODEL_PATH is not set.")
+
     # Do we have to load the tflite or protobuf model?
     if cfg.MODEL_PATH.endswith(".tflite"):
         if not INTERPRETER:
             # Load TFLite model and allocate tensors.
-            INTERPRETER = tflite.Interpreter(
-                model_path=os.path.join(SCRIPT_DIR, cfg.MODEL_PATH), num_threads=cfg.TFLITE_THREADS
-            )
+            INTERPRETER = _load_interpreter(os.path.join(SCRIPT_DIR, cfg.MODEL_PATH), cfg.TFLITE_THREADS)
             INTERPRETER.allocate_tensors()
 
             # Get input and output tensors.
@@ -535,6 +555,7 @@ def load_model(class_output=True):
         # Load protobuf model
         # Note: This will throw a bunch of warnings about custom gradients
         # which we will ignore until TF lets us block them
+        # TODO: pretty sure this doesn't work anymore, but I don't think anyone uses it
         PBMODEL = keras.models.load_model(os.path.join(SCRIPT_DIR, cfg.MODEL_PATH), compile=False)
 
 
@@ -551,9 +572,12 @@ def load_custom_classifier():
     global C_INPUT_SIZE
     global C_PBMODEL
 
+    if cfg.CUSTOM_CLASSIFIER is None:
+        raise ValueError("CUSTOM_CLASSIFIER is not set.")
+
     if cfg.CUSTOM_CLASSIFIER.endswith(".tflite"):
         # Load TFLite model and allocate tensors.
-        C_INTERPRETER = tflite.Interpreter(model_path=cfg.CUSTOM_CLASSIFIER, num_threads=cfg.TFLITE_THREADS)
+        C_INTERPRETER = _load_interpreter(cfg.CUSTOM_CLASSIFIER, cfg.TFLITE_THREADS)
         C_INTERPRETER.allocate_tensors()
 
         # Get input and output tensors.
@@ -568,10 +592,6 @@ def load_custom_classifier():
         # Get classification output
         C_OUTPUT_LAYER_INDEX = output_details[0]["index"]
     else:
-        import tensorflow as tf
-
-        tf.get_logger().setLevel("ERROR")
-
         C_PBMODEL = tf.saved_model.load(cfg.CUSTOM_CLASSIFIER)
 
 
@@ -585,9 +605,7 @@ def load_meta_model():
     global M_OUTPUT_LAYER_INDEX
 
     # Load TFLite model and allocate tensors.
-    M_INTERPRETER = tflite.Interpreter(
-        model_path=os.path.join(SCRIPT_DIR, cfg.MDATA_MODEL_PATH), num_threads=cfg.TFLITE_THREADS
-    )
+    M_INTERPRETER = _load_interpreter(os.path.join(SCRIPT_DIR, cfg.MDATA_MODEL_PATH), cfg.TFLITE_THREADS)
     M_INTERPRETER.allocate_tensors()
 
     # Get input and output tensors.
@@ -611,17 +629,11 @@ def build_linear_classifier(num_labels, input_size, hidden_units=0, dropout=0.0)
     Returns:
         A new classifier.
     """
-    # import keras
-    from tensorflow import keras
-
     # Build a simple one- or two-layer linear classifier
     model = keras.Sequential()
 
     # Input layer
     model.add(keras.layers.InputLayer(input_shape=(input_size,)))
-
-    # Batch normalization on input to standardize embeddings
-    model.add(keras.layers.BatchNormalization())
 
     # Optional L2 regularization for all dense layers
     regularizer = keras.regularizers.l2(1e-5)
@@ -633,14 +645,7 @@ def build_linear_classifier(num_labels, input_size, hidden_units=0, dropout=0.0)
             model.add(keras.layers.Dropout(dropout))
 
         # Add a hidden layer with L2 regularization
-        model.add(
-            keras.layers.Dense(
-                hidden_units, activation="relu", kernel_regularizer=regularizer, kernel_initializer="he_normal"
-            )
-        )
-
-        # Add another batch normalization after the hidden layer
-        model.add(keras.layers.BatchNormalization())
+        model.add(keras.layers.Dense(hidden_units, activation="relu", kernel_regularizer=regularizer, kernel_initializer="he_normal"))
 
     # Dropout layer before output
     if dropout > 0:
@@ -700,8 +705,6 @@ def train_linear_classifier(
     Returns:
         (classifier, history)
     """
-    # import keras
-    from tensorflow import keras
 
     class FunctionCallback(keras.callbacks.Callback):
         def __init__(self, on_epoch_end=None) -> None:
@@ -756,8 +759,8 @@ def train_linear_classifier(
     callbacks = [
         # EarlyStopping with restore_best_weights
         keras.callbacks.EarlyStopping(
-            monitor="val_AUPRC",
-            mode="max",
+            monitor="val_loss",
+            mode="min",
             patience=patience,
             verbose=1,
             min_delta=min_delta,
@@ -782,17 +785,15 @@ def train_linear_classifier(
     # Add LR scheduler callback
     callbacks.append(keras.callbacks.LearningRateScheduler(lr_schedule))
 
-    optimizer_cls = keras.optimizers.legacy.Adam if sys.platform == "darwin" else keras.optimizers.Adam
-
     def _focal_loss(y_true, y_pred):
-        return focal_loss(y_true, y_pred, gamma=cfg.FOCAL_LOSS_GAMMA, alpha=cfg.FOCAL_LOSS_ALPHA)
+        return focal_loss(y_true, y_pred, gamma=focal_loss_gamma, alpha=focal_loss_alpha)
 
     # Choose the loss function based on config
     loss_function = _focal_loss if train_with_focal_loss else custom_loss
 
     # Compile model with appropriate metrics for classification task
     classifier.compile(
-        optimizer=optimizer_cls(learning_rate=learning_rate),
+        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
         loss=loss_function,
         metrics=[
             keras.metrics.AUC(
@@ -813,14 +814,12 @@ def train_linear_classifier(
     )
 
     # Train model
-    history = classifier.fit(
-        x_train, y_train, epochs=epochs, batch_size=batch_size, validation_data=(x_val, y_val), callbacks=callbacks
-    )
+    history = classifier.fit(x_train, y_train, epochs=epochs, batch_size=batch_size, validation_data=(x_val, y_val), callbacks=callbacks)
 
     return classifier, history
 
 
-def save_linear_classifier(classifier, model_path: str, labels: list[str], mode="replace"):
+def save_linear_classifier(classifier, model_path: str, labels: list[str], mode: Literal["replace", "append"] = "replace"):
     """Saves the classifier as a tflite model, as well as the used labels in a .txt.
 
     Args:
@@ -828,30 +827,25 @@ def save_linear_classifier(classifier, model_path: str, labels: list[str], mode=
         model_path: Path the model will be saved at.
         labels: List of labels used for the classifier.
     """
-    import tensorflow as tf
-
     global PBMODEL
 
-    tf.get_logger().setLevel("ERROR")
+    if mode not in ("replace", "append"):
+        raise ValueError("Model save mode must be either 'replace' or 'append'")
 
     if PBMODEL is None:
-        PBMODEL = tf.keras.models.load_model(os.path.join(SCRIPT_DIR, cfg.PB_MODEL), compile=False)
+        PBMODEL = tf.saved_model.load(os.path.join(SCRIPT_DIR, cfg.PB_MODEL))
 
     saved_model = PBMODEL
-
-    # Remove activation layer
-    classifier.pop()
+    inputs = keras.Input(shape=(144000,), dtype=tf.float32, name="input_audio")
+    wrapper = WrappedSavedModel(saved_model.signatures["embeddings"])(inputs)
 
     if mode == "replace":
-        combined_model = tf.keras.Sequential([saved_model.embeddings_model, classifier], "basic")
+        output = classifier(wrapper)
     elif mode == "append":
-        intermediate = classifier(saved_model.model.get_layer("GLOBAL_AVG_POOL").output)
+        basic = WrappedSavedModel(saved_model.signatures["basic"])(inputs)
+        output = keras.layers.concatenate([basic, classifier(wrapper)], name="combined_output")
 
-        output = tf.keras.layers.concatenate([saved_model.model.output, intermediate], name="combined_output")
-
-        combined_model = tf.keras.Model(inputs=saved_model.model.input, outputs=output)
-    else:
-        raise ValueError("Model save mode must be either 'replace' or 'append'")
+    combined_model = keras.Model(inputs=inputs, outputs=output, name="basic")
 
     # Append .tflite if necessary
     if not model_path.endswith(".tflite"):
@@ -862,7 +856,7 @@ def save_linear_classifier(classifier, model_path: str, labels: list[str], mode=
 
     # Save model as tflite
     converter = tf.lite.TFLiteConverter.from_keras_model(combined_model)
-    tflite_model = converter.convert()
+    tflite_model: bytes = converter.convert()
 
     with open(model_path, "wb") as f:
         f.write(tflite_model)
@@ -877,7 +871,7 @@ def save_linear_classifier(classifier, model_path: str, labels: list[str], mode=
     save_model_params(model_path.replace(".tflite", "_Params.csv"))
 
 
-def save_raven_model(classifier, model_path: str, labels: list[str], mode="replace"):
+def save_raven_model(classifier, model_path: str, labels: list[str], mode: Literal["replace", "append"] = "replace"):
     """
     Save a TensorFlow model with a custom classifier and associated metadata for use with BirdNET.
 
@@ -894,52 +888,26 @@ def save_raven_model(classifier, model_path: str, labels: list[str], mode="repla
     Returns:
         None
     """
-    import csv
-    import json
-
-    import tensorflow as tf
-
     global PBMODEL
 
-    tf.get_logger().setLevel("ERROR")
-
     if PBMODEL is None:
-        PBMODEL = tf.keras.models.load_model(os.path.join(SCRIPT_DIR, cfg.PB_MODEL), compile=False)
+        PBMODEL = tf.saved_model.load(os.path.join(SCRIPT_DIR, cfg.PB_MODEL))
 
-    saved_model = PBMODEL
+    model_cls = custom_models.CombinedModelAppendWithSigmoid if mode == "append" else custom_models.CombinedModelReplaceWithSigmoid
+    combined_model = model_cls(PBMODEL, classifier)
 
-    if mode == "replace":
-        combined_model = tf.keras.Sequential([saved_model.embeddings_model, classifier], "basic")
-    elif mode == "append":
-        # Remove activation layer
-        classifier.pop()
-        intermediate = classifier(saved_model.model.get_layer("GLOBAL_AVG_POOL").output)
+    @tf.function(input_signature=[tf.TensorSpec(shape=[None, 144000], dtype=tf.float32)])  # pyright: ignore[reportCallIssue]
+    def basic(inputs):
+        return {"scores": combined_model(inputs)}
 
-        output = tf.keras.layers.concatenate([saved_model.model.output, intermediate], name="combined_output")
-
-        combined_model = tf.keras.Model(inputs=saved_model.model.input, outputs=output)
-    else:
-        raise ValueError("Model save mode must be either 'replace' or 'append'")
-
-    # Make signatures
-    class SignatureModule(tf.Module):
-        def __init__(self, keras_model):
-            super().__init__()
-            self.model = keras_model
-
-        @tf.function(input_signature=[tf.TensorSpec(shape=[None, 144000], dtype=tf.float32)])
-        def basic(self, inputs):
-            return {"scores": self.model(inputs)}
-
-    smodel = SignatureModule(combined_model)
     signatures = {
-        "basic": smodel.basic,
+        "basic": basic,
     }
 
     # Save signature model
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
     model_path = model_path.removesuffix(".tflite")
-    tf.saved_model.save(smodel, model_path, signatures=signatures)
+    tf.saved_model.save(combined_model, model_path, signatures=signatures)
 
     if mode == "append":
         labels = [*utils.read_lines(os.path.join(SCRIPT_DIR, cfg.LABELS_FILE)), *labels]
@@ -1067,17 +1035,15 @@ def focal_loss(y_true, y_pred, gamma=2.0, alpha=0.25, epsilon=1e-7):
     Returns:
         Focal loss value.
     """
-    import tensorflow.keras.backend as K
-
     # Apply sigmoid if not already applied
-    y_pred = K.clip(y_pred, epsilon, 1.0 - epsilon)
+    y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
 
     # Calculate cross entropy
-    cross_entropy = -y_true * K.log(y_pred) - (1 - y_true) * K.log(1 - y_pred)
+    cross_entropy = -y_true * tf.math.log(y_pred) - (1 - y_true) * tf.math.log(1 - y_pred)
 
     # Calculate focal weight
     p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
-    focal_weight = K.pow(1 - p_t, gamma)
+    focal_weight = tf.pow(1 - p_t, gamma)
 
     # Apply alpha balancing
     alpha_factor = y_true * alpha + (1 - y_true) * (1 - alpha)
@@ -1086,17 +1052,15 @@ def focal_loss(y_true, y_pred, gamma=2.0, alpha=0.25, epsilon=1e-7):
     focal_loss = alpha_factor * focal_weight * cross_entropy
 
     # Sum over all classes
-    return K.sum(focal_loss, axis=-1)
+    return tf.reduce_sum(focal_loss, axis=-1)
 
 
 def custom_loss(y_true, y_pred, epsilon=1e-7):
-    import tensorflow.keras.backend as K
-
     # Calculate loss for positive labels with epsilon
-    positive_loss = -K.sum(y_true * K.log(K.clip(y_pred, epsilon, 1.0 - epsilon)), axis=-1)
+    positive_loss = -tf.reduce_sum(y_true * tf.math.log(tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)), axis=-1)
 
     # Calculate loss for negative labels with epsilon
-    negative_loss = -K.sum((1 - y_true) * K.log(K.clip(1 - y_pred, epsilon, 1.0 - epsilon)), axis=-1)
+    negative_loss = -tf.reduce_sum((1 - y_true) * tf.math.log(tf.clip_by_value(1 - y_pred, epsilon, 1.0 - epsilon)), axis=-1)
 
     # Combine both loss terms
     return positive_loss + negative_loss
@@ -1130,6 +1094,19 @@ def flat_sigmoid(x, sensitivity=-1, bias=1.0):
     return 1 / (1.0 + np.exp(sensitivity * np.clip(x + transformed_bias, -20, 20)))
 
 
+def predict_with_perch(data: np.ndarray):
+    global PERCH_MODEL
+
+    if PERCH_MODEL is None:
+        PERCH_MODEL = tf.saved_model.load(
+            cfg.MODEL_PATH,
+        )
+
+    result = PERCH_MODEL.signatures["serving_default"](inputs=data)
+
+    return tf.nn.softmax(result["label"], axis=-1).numpy()
+
+
 def predict(sample):
     """Uses the main net to predict a sample.
 
@@ -1142,6 +1119,9 @@ def predict(sample):
     # Has custom classifier?
     if cfg.CUSTOM_CLASSIFIER is not None:
         return predict_with_custom_classifier(sample)
+
+    if cfg.USE_PERCH:
+        return predict_with_perch(sample)
 
     load_model()
 
@@ -1197,7 +1177,6 @@ def embeddings(sample):
     Returns:
         The embeddings.
     """
-
     load_model(False)
 
     sample = np.array(sample, dtype="float32")

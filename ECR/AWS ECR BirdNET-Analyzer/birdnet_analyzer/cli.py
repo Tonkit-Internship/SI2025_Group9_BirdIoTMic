@@ -80,6 +80,7 @@ def bandpass_args():
 
     return p
 
+
 def species_list_args():
     """
     Creates an argument parser for species-list arguments.
@@ -111,6 +112,7 @@ def species_list_args():
     )
     return p
 
+
 def species_args():
     """
     Creates an argument parser for species-related arguments including the species-list arguments.
@@ -137,7 +139,7 @@ def sigmoid_args():
     """
     Creates an argument parser for sigmoid sensitivity.
     This function sets up an argument parser with a single argument `--sensitivity`.
-    The sensitivity value is constrained to be within the range [0.75, 1.25], where higher
+    The sensitivity value is constrained to be within the range [0.5, 1.5], where higher
     values result in higher detection sensitivity. The default value is taken from
     `cfg.SIGMOID_SENSITIVITY`.
     Returns:
@@ -146,9 +148,9 @@ def sigmoid_args():
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument(
         "--sensitivity",
-        type=lambda a: min(1.25, max(0.75, float(a))),
+        type=lambda a: min(1.5, max(0.5, float(a))),
         default=cfg.SIGMOID_SENSITIVITY,
-        help="Detection sensitivity; Higher values result in higher sensitivity. Values in [0.75, 1.25]. Values other than 1.0 will shift the sigmoid functionon the x-axis. Use complementary to the cut-off threshold.",
+        help="Detection sensitivity; Higher values result in higher sensitivity. Values in [0.5, 1.5]. Values other than 1.0 will shift the sigmoid functionon the x-axis. Use complementary to the cut-off threshold.",
     )
 
     return p
@@ -166,8 +168,8 @@ def overlap_args(help_string="Overlap of prediction segments. Values in [0.0, 2.
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument(
         "--overlap",
-        type=lambda a: max(0.0, min(2.9, float(a))),
-        default=cfg.SIG_OVERLAP,
+        type=lambda a: max(0.0, min(4.9, float(a))),
+        default=0.0,
         help=help_string,
     )
 
@@ -325,6 +327,7 @@ def analyzer_parser():
         argparse.ArgumentParser: Configured argument parser for the BirdNET Analyzer CLI.
     """
     from birdnet_analyzer.analyze import POSSIBLE_ADDITIONAL_COLUMNS_MAP
+
     parents = [
         io_args(),
         bandpass_args(),
@@ -395,6 +398,8 @@ def analyzer_parser():
         help="Maximum number of consecutive detections above MIN_CONF to merge for each detected species. This will result in fewer entires in the result file with segments longer than 3 seconds. Set to 0 or 1 to disable merging. Set to None to include all consecutive detections. We use the mean of the top 3 scores from all consecutive detections for merging.",
     )
 
+    parser.add_argument("--use_perch", action="store_true", help="Use the Perch model for detection.")
+
     return parser
 
 
@@ -414,7 +419,7 @@ def embeddings_parser():
         argparse.ArgumentParser: Configured argument parser for extracting feature embeddings.
     """
 
-    parents = [db_args(), bandpass_args(), audio_speed_args(), overlap_args(), threads_args(), bs_args()]
+    parents = [db_args(), bandpass_args(), audio_speed_args(), overlap_args(), threads_args(), bs_args(default=8)]
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -428,9 +433,7 @@ def embeddings_parser():
         help="Path to input file or folder.",
     )
 
-    parser.add_argument(
-        "--file_output",
-    )
+    parser.add_argument("--file_output", help="Saves all embeddings contained in the database in a csv file.")
 
     return parser
 
@@ -537,8 +540,29 @@ def segments_parser():
     parser.add_argument(
         "--seg_length",
         type=lambda a: max(1.0, float(a)),
-        default=cfg.SIG_LENGTH,
+        default=cfg.BIRDNET_SIG_LENGTH,
         help="Minimum length of extracted segments in seconds. If a segment is shorter than this value, it will be padded with audio from the source file.",
+    )
+
+    parser.add_argument(
+        "--max_conf",
+        default=cfg.MAX_CONFIDENCE,
+        type=lambda a: max(0.00001, min(1.0, float(a))),
+        help="Maximum confidence threshold. Values in [0.00001, 1.0].",
+    )
+
+    parser.add_argument(
+        "--collection_mode",
+        default=cfg.SEGMENTS_COLLECTION_MODE,
+        choices=["random", "confidence", "balanced"],
+        help="Collection mode for selecting the segments. Can be 'random' or 'confidence'.",
+    )
+
+    parser.add_argument(
+        "--n_bins",
+        type=lambda a: max(2, int(a)),
+        default=10,
+        help="Number of bins to use for the balanced collection mode",
     )
 
     return parser
