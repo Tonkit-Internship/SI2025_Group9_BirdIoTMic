@@ -1,79 +1,98 @@
 import json
-import os
 import boto3
+import os
+from decimal import Decimal 
+from urllib.parse import unquote_plus
 from datetime import datetime
-from decimal import Decimal  # <-- เพิ่ม
 
-s3_client = boto3.client('s3')
+s3 = boto3.client('s3')
 dynamodb = boto3.resource('dynamodb')
-table = dynamodb.Table('bird_iot_mic')
 
-BUCKET_NAME = os.environ.get('BUCKET_NAME', 'bird.iot.mic')
+# Environment Variables
+AUDIO_BUCKET = os.environ.get('AUDIO_BUCKET')
+METADATA_BUCKET = os.environ.get('METADATA_BUCKET')
+ABNORMAL_BUCKET = os.environ.get('ABNORMAL_BUCKET')
+TABLE_NAME = os.environ.get('TABLE_NAME')
 
 def lambda_handler(event, context):
-    print("EVENT:", json.dumps(event))
-    try:
-        if "body" in event:
-            body = json.loads(event['body'])
-        else:
-            body = event
+    table = dynamodb.Table(TABLE_NAME)
+    
+    for record in event['Records']:
+        source_bucket = record['s3']['bucket']['name']
+        source_key = unquote_plus(record['s3']['object']['key'])
         
-        device_id = body['device_id']
-        data = body['data']
+        filename = os.path.basename(source_key) # เช่น 20250719_0633_ESP32...wav
+        extension = filename.lower().split('.')[-1]
+        target_bucket = ""
 
-        presigned_urls_all = {}
-
-        for entry in data:
-            timestamp = entry['timestamp']
-            files = entry.get('files', [])
-            location = entry.get('location', 'unknown')
+        # --- 1. Logic สร้าง Subfolder จากชื่อไฟล์ ---
+        try:
+            # สมมติชื่อไฟล์: 20250719_0633_...
+            # แยกด้วย underscore (_) แล้วเอาตัวแรก -> "20250719"
+            date_part = filename.split('_')[0] 
             
-            # แปลง float เป็น Decimal
-            temperature = entry.get('temperature_c', None)
-            if temperature is not None:
-                temperature = Decimal(str(temperature))
-            
-            humidity = entry.get('humidity_percent', None)
-            if humidity is not None:
-                humidity = Decimal(str(humidity))
+            if len(date_part) == 8 and date_part.isdigit():
+                year = date_part[0:4]   # "2025"
+                month = date_part[4:6]  # "07"
+                day = date_part[6:8]    # "19"
+                folder_prefix = f"{year}/{month}/{day}"
+            else:
+                raise ValueError("Date format mismatch")
+                
+        except Exception as e:
+            # กรณีชื่อไฟล์ไม่ตรงรูปแบบ (เช่น test.wav) ให้ใช้วันที่ปัจจุบันแทน
+            print(f"⚠️ Cannot parse date from filename: {e}. Using Today's date.")
+            now = datetime.now()
+            folder_prefix = now.strftime('%Y/%m/%d')
+        
+        # สร้าง Key ปลายทาง: "2025/07/19/ชื่อไฟล์เดิม"
+        target_key = f"{folder_prefix}/{filename}"
+        # -------------------------------------------
 
-            dt = datetime.fromisoformat(timestamp.replace("Z", ""))
-            date_str = dt.strftime("%Y-%m-%d")
-            hour_str = dt.strftime("%H")
-            device_id =  entry['board_id']
-            light_adc  = entry['light_adc']
-            presigned_urls = {}
-            for filename in files:
-                key = f"{date_str}/{device_id}/{hour_str}/{filename}"
-                url = s3_client.generate_presigned_url(
-                    'put_object',
-                    Params={'Bucket': BUCKET_NAME, 'Key': key, 'ContentType': 'audio/wav'},
-                    ExpiresIn=300
+        # 2. จัดการ JSON
+        if extension == 'json':
+            target_bucket = METADATA_BUCKET
+            try:
+                response = s3.get_object(Bucket=source_bucket, Key=source_key)
+                data = json.loads(response['Body'].read().decode('utf-8'), parse_float=Decimal)
+                
+                table.put_item(
+                    Item={
+                        'DATE': data.get('timestamp'),          
+                        'DEVICE': data.get('board_id'),         
+                        'species': [],                          
+                        'temperature_c': data.get('temperature_c'),
+                        'humidity': data.get('humidity_percent'),
+                        'light': data.get('light_adc'),
+                        'location': data.get('location'),       
+                        'status': 'pending_analysis',
+                        's3_path': target_key  # บันทึก Path ใหม่เก็บไว้
+                    }
                 )
-                presigned_urls[filename] = url
+                print(f"✅ Data for {data.get('board_id')} saved to DynamoDB")
+            except Exception as e:
+                print(f"⚠️ DynamoDB Save Error: {e}")
 
-            presigned_urls_all[timestamp] = presigned_urls
+        # 3. จัดการ WAV
+        elif extension == 'wav':
+            target_bucket = AUDIO_BUCKET
+            print(f"🎵 Audio file detected: {filename}")
 
-            table.put_item(Item={
-                "DATE": timestamp,   
-                "DEVICE": device_id,
-                "location": location,
-                "temperature_c": temperature,
-                "humidity": humidity,
-                "light" : light_adc,
-                "files": files,
-                "species": []
-            })
+        # 4. ไฟล์อื่นๆ
+        else:
+            target_bucket = ABNORMAL_BUCKET
+            print(f"⚠️ Unknown file type. Moving to Quarantine.")
 
-        return {
-            'statusCode': 200,
-            'body': json.dumps({'presigned_urls': presigned_urls_all}),
-            'headers': {'Content-Type': 'application/json'}
-        }
+        # ขั้นตอนการย้ายไฟล์
+        if target_bucket:
+            try:
+                copy_source = {'Bucket': source_bucket, 'Key': source_key}
+                
+                s3.copy_object(CopySource=copy_source, Bucket=target_bucket, Key=target_key)
+                s3.delete_object(Bucket=source_bucket, Key=source_key)
+                
+                print(f"🚀 Moved to: {target_bucket}/{target_key}")
+            except Exception as e:
+                print(f"❌ Move failed: {e}")
 
-    except Exception as e:
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'error': str(e)}),
-            'headers': {'Content-Type': 'application/json'}
-        }
+    return {'statusCode': 200}

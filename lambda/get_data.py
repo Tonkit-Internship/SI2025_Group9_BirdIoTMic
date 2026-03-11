@@ -1,5 +1,6 @@
 import json
 import boto3
+import os
 from boto3.dynamodb.conditions import Key
 import decimal
 from operator import itemgetter
@@ -12,7 +13,9 @@ class DecimalEncoder(json.JSONEncoder):
 
 def lambda_handler(event, context):
     dynamodb = boto3.resource('dynamodb')
-    table = dynamodb.Table('bird_iot_mic')
+    
+    table_name = os.environ.get('TABLE_NAME')
+    table = dynamodb.Table(table_name)
 
     # ดึง query string parameter จาก API Gateway
     params = event.get("queryStringParameters") or {}
