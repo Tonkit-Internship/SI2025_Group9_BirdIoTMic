@@ -1,0 +1,13 @@
+librosa>=0.11.0
+resampy
+tensorflow-cpu>=2.16.1
+tqdm
+pandas
+matplotlib
+kagglehub
+boto3
+
+# 🔥 เพิ่ม 3 บรรทัดนี้กลับเข้ามา เพื่อบังคับใช้ Numba ตัวที่เสถียรบน Python 3.11 ครับ
+numpy<2.0.0
+numba>=0.60.0
+llvmlite>=0.43.0
