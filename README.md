@@ -1,1 +1,1 @@
-# SI2025_Group9_BirdIoTMic
+# โค้ดชุดนี่คือการนำ BirdNET-Analyzer มาปรับแต่งให้สามารถรันบน AWS ได้
